@@ -1,0 +1,26 @@
+global:
+  scrape_interval:     15s 
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'wx-org.chainmaker.org-pbft'
+    scrape_interval: 15s
+    static_configs:
+      - targets: ['host.docker.internal:14331']
+        labels:
+          node: 'node1'
+      - targets: ['host.docker.internal:14332']
+        labels:
+          node: 'node2'
+      - targets: ['host.docker.internal:14333']
+        labels:
+          node: 'node3'
+      - targets: ['host.docker.internal:14334']
+        labels:
+          node: 'node4'
+
+remote_write:
+  - url: "http://influxdb_pbft:8086/api/v1/prom/write?db=prometheus_pbft"
+
+remote_read:
+  - url: "http://influxdb_pbft:8086/api/v1/prom/read?db=prometheus_pbft"
