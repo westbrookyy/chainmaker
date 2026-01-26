@@ -21,60 +21,83 @@ type ConsensusMsg struct {
 
 // sendConsensusMsg sends consensus msg, If to is an empty string, send to all validators
 func (consensus *ConsensusPBFTImpl) sendConsensusMsg(msg proto.Message, to string) {
+	consensus.logger.Infof("[%s] sendConsensusMsg: called with to='%s'", consensus.Id, to)
 	if msg == nil {
+		consensus.logger.Warnf("[%s] sendConsensusMsg: message is nil", consensus.Id)
 		return
 	}
 
-	var validators []string
+	// Marshal the message once
+	consensus.logger.Infof("[%s] sendConsensusMsg: starting to marshal consensus message", consensus.Id)
+	msgBz := mustMarshal(msg)
+	if msgBz == nil {
+		consensus.logger.Errorf("[%s] sendConsensusMsg: failed to marshal consensus message", consensus.Id)
+		return
+	}
+	consensus.logger.Infof("[%s] sendConsensusMsg: marshaled consensus message, size: %d", consensus.Id, len(msgBz))
+
+	pbftMsg := &pbftpb.PBFTMsg{
+		Type: getPBFTMsgType(msg),
+		Msg:  msgBz,
+	}
+
+	// Marshal the PBFT message once
+	consensus.logger.Infof("[%s] sendConsensusMsg: starting to marshal PBFT message", consensus.Id)
+	pbftMsgBz := mustMarshal(pbftMsg)
+	if pbftMsgBz == nil {
+		consensus.logger.Errorf("[%s] sendConsensusMsg: failed to marshal PBFT message", consensus.Id)
+		return
+	}
+	consensus.logger.Infof("[%s] sendConsensusMsg: marshaled PBFT message, size: %d, type: %v", 
+		consensus.Id, len(pbftMsgBz), pbftMsg.Type)
+
 	if to != "" {
-		validators = append(validators, to)
-	} else {
-		// Safely access validatorSet.Validators with lock protection
-		consensus.RLock()
-		validators = make([]string, len(consensus.validatorSet.Validators))
-		copy(validators, consensus.validatorSet.Validators)
-		consensus.RUnlock()
-	}
-
-	if len(validators) == 0 {
-		consensus.logger.Warnf("%s no validators to send consensus message", consensus.Id)
-		return
-	}
-
-	consensus.logger.Infof("%s ready send consensus message to %v ", consensus.Id, validators)
-	for _, v := range validators {
-		// The recipient is yourself
-		if v == consensus.Id {
-			continue
+		// Send to specific node (unicast)
+		consensus.logger.Infof("[%s] sendConsensusMsg: sending to specific node %s", consensus.Id, to)
+		netMsg := &netpb.NetMsg{
+			Payload: pbftMsgBz,
+			Type:    netpb.NetMsg_CONSENSUS_MSG,
+			To:      to,
 		}
-		go func(validator string) {
-			// Marshal the message
-			msgBz := mustMarshal(msg)
-			if msgBz == nil {
-				consensus.logger.Errorf("%s failed to marshal consensus message", consensus.Id)
-				return
-			}
+		consensus.logger.Infof("[%s] publishing consensus message to msgbus (to: %s, type: %v, size: %d)", 
+			consensus.Id, to, pbftMsg.Type, len(pbftMsgBz))
+		consensus.msgbus.Publish(msgbus.SendConsensusMsg, netMsg)
+		consensus.logger.Debugf("[%s] consensus message published to msgbus for %s", consensus.Id, to)
+	} else {
+		// Broadcast to all validators using consensus broadcast mechanism
+		// Check validatorSet to ensure it's initialized
+		consensus.logger.Infof("[%s] sendConsensusMsg: acquiring read lock to access validatorSet", consensus.Id)
+		consensus.RLock()
+		consensus.logger.Infof("[%s] sendConsensusMsg: read lock acquired successfully", consensus.Id)
+		if consensus.validatorSet == nil {
+			consensus.RUnlock()
+			consensus.logger.Warnf("[%s] sendConsensusMsg: validatorSet is nil", consensus.Id)
+			return
+		}
+		validatorCount := len(consensus.validatorSet.Validators)
+		consensus.logger.Infof("[%s] sendConsensusMsg: validatorSet found, has %d validators: %v", 
+			consensus.Id, validatorCount, consensus.validatorSet.Validators)
+		consensus.RUnlock()
+		consensus.logger.Infof("[%s] sendConsensusMsg: read lock released", consensus.Id)
 
-			pbftMsg := &pbftpb.PBFTMsg{
-				Type: getPBFTMsgType(msg),
-				Msg:  msgBz,
-			}
+		if validatorCount == 0 {
+			consensus.logger.Warnf("[%s] sendConsensusMsg: no validators to send consensus message", consensus.Id)
+			return
+		}
 
-			// Marshal the PBFT message
-			pbftMsgBz := mustMarshal(pbftMsg)
-			if pbftMsgBz == nil {
-				consensus.logger.Errorf("%s failed to marshal PBFT message", consensus.Id)
-				return
-			}
-
-			netMsg := &netpb.NetMsg{
-				Payload: pbftMsgBz,
-				Type:    netpb.NetMsg_CONSENSUS_MSG,
-				To:      validator,
-			}
-			consensus.logger.Infof("%s send consensus message to %s succeeded", consensus.Id, validator)
-			consensus.msgbus.Publish(msgbus.SendConsensusMsg, netMsg)
-		}(v)
+		// Send broadcast message with empty To field to trigger consensus broadcast
+		consensus.logger.Infof("[%s] sendConsensusMsg: broadcasting to all validators using consensus broadcast (total: %d)", 
+			consensus.Id, validatorCount)
+		netMsg := &netpb.NetMsg{
+			Payload: pbftMsgBz,
+			Type:    netpb.NetMsg_CONSENSUS_MSG,
+			To:      "", // Empty To field triggers broadcast
+		}
+		consensus.logger.Infof("[%s] publishing consensus broadcast message to msgbus (type: %v, size: %d)", 
+			consensus.Id, pbftMsg.Type, len(pbftMsgBz))
+		consensus.logger.Infof("[%s] sendConsensusMsg: about to call msgbus.Publish", consensus.Id)
+		consensus.msgbus.Publish(msgbus.SendConsensusMsg, netMsg)
+		consensus.logger.Infof("[%s] sendConsensusMsg: consensus broadcast message published to msgbus", consensus.Id)
 	}
 }
 
@@ -105,10 +128,13 @@ func getPBFTMsgType(msg proto.Message) pbftpb.PBFTMsgType {
 // sendConsensusPrePrepare sends pre-prepare message
 func (consensus *ConsensusPBFTImpl) sendConsensusPrePrepare(prePrepare *pbftpb.PrePrepare, to string) {
 	if prePrepare == nil {
+		consensus.logger.Warnf("[%s] sendConsensusPrePrepare: prePrepare is nil", consensus.Id)
 		return
 	}
-	consensus.logger.Infof("%s send consensus pre-prepare", consensus.Id)
+	consensus.logger.Infof("[%s] sendConsensusPrePrepare: calling sendConsensusMsg (to='%s', sequence=%d, view=%d)", 
+		consensus.Id, to, prePrepare.Sequence, prePrepare.View)
 	consensus.sendConsensusMsg(prePrepare, to)
+	consensus.logger.Infof("[%s] sendConsensusPrePrepare: sendConsensusMsg returned", consensus.Id)
 }
 
 // sendConsensusPrepare sends prepare message

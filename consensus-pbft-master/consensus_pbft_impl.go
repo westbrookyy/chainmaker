@@ -37,6 +37,34 @@ var (
 	nilHash = []byte("NilHash")
 )
 
+// CopyPrePrepareForSigning creates a new PrePrepare instance for signing and verification
+// This ensures consistent serialization by explicitly copying only the necessary fields
+// Reference: TBFT's CopyProposalWithBlockHeader which only copies Block.Header and excludes TxsRwSet
+// TxsRwSet is excluded from signing/verification because it may be updated after verification
+// instead of using proto.Clone which may introduce serialization inconsistencies
+func CopyPrePrepareForSigning(p *pbftpb.PrePrepare) *pbftpb.PrePrepare {
+	if p == nil {
+		return nil
+	}
+	// Create a new Block with only Header, similar to TBFT's CopyProposalWithBlockHeader
+	var block *common.Block
+	if p.Block != nil {
+		block = &common.Block{
+			Header: p.Block.Header,
+		}
+	}
+	return &pbftpb.PrePrepare{
+		Primary:     p.Primary,
+		View:        p.View,
+		Sequence:    p.Sequence,
+		Digest:      p.Digest,
+		Block:       block,
+		Endorsement: nil, // Explicitly set to nil for signing/verification
+		// TxsRwSet is excluded from signing/verification, same as TBFT's CopyProposalWithBlockHeader
+		// TxsRwSet may be updated after verification (see line 2273), so it should not be included in signature
+	}
+}
+
 func mustMarshalRecover(msg proto.Message) (data []byte) {
 	var err error
 	defer func() {
@@ -66,25 +94,50 @@ func mustMarshalWal(msg proto.Message) (data []byte) {
 
 // isPrimary checks if the current node is the primary node for the current view
 func (consensus *ConsensusPBFTImpl) isPrimary() bool {
-	primary, err := consensus.validatorSet.GetPrimary(consensus.View, consensus.Sequence)
-	if err != nil {
+	if consensus.validatorSet == nil {
+		consensus.logger.Warnf("[%s] validatorSet is nil, cannot determine primary", consensus.Id)
 		return false
 	}
-	return primary == consensus.Id
+
+	primary, err := consensus.validatorSet.GetPrimary(consensus.View, consensus.Sequence)
+	if err != nil {
+		consensus.logger.Warnf("[%s] failed to get primary for view %d, sequence %d: %v",
+			consensus.Id, consensus.View, consensus.Sequence, err)
+		return false
+	}
+
+	isPrimary := primary == consensus.Id
+	if isPrimary {
+		consensus.logger.Infof("[%s] is primary for view %d, sequence %d (primary: %s)",
+			consensus.Id, consensus.View, consensus.Sequence, primary)
+	} else {
+		consensus.logger.Infof("[%s] is not primary for view %d, sequence %d (primary: %s, self: %s)",
+			consensus.Id, consensus.View, consensus.Sequence, primary, consensus.Id)
+	}
+	return isPrimary
 }
 
 // signPrePrepare signs a PrePrepare message
 func (consensus *ConsensusPBFTImpl) signPrePrepare(prePrepare *pbftpb.PrePrepare) error {
 	// Create a copy without endorsement for signing
-	prePrepareCopy := &pbftpb.PrePrepare{
-		Primary:  prePrepare.Primary,
-		View:     prePrepare.View,
-		Sequence: prePrepare.Sequence,
-		Digest:   prePrepare.Digest,
-		Block:    prePrepare.Block,
-		TxsRwSet: prePrepare.TxsRwSet,
-	}
+	// Use CopyPrePrepareForSigning to ensure consistent serialization
+	// instead of proto.Clone which may introduce serialization inconsistencies
+	prePrepareCopy := CopyPrePrepareForSigning(prePrepare)
+
+	// Log before serialization to measure time
+	startTime := time.Now()
 	prePrepareBz := mustMarshal(prePrepareCopy)
+	serializeDuration := time.Since(startTime)
+
+	// Log serialization details for debugging
+	blockTxCount := 0
+	if prePrepareCopy.Block != nil && prePrepareCopy.Block.Header != nil {
+		blockTxCount = int(prePrepareCopy.Block.Header.TxCount)
+	}
+	consensus.logger.Infof("[%s] signPrePrepare: serialized size=%d bytes (%.2f MB), serialize time=%v, txCount=%d, hasBlock=%v, hasTxsRwSet=%v, sequence=%d, view=%d",
+		consensus.Id, len(prePrepareBz), float64(len(prePrepareBz))/1024/1024, serializeDuration,
+		blockTxCount, prePrepareCopy.Block != nil, prePrepareCopy.TxsRwSet != nil,
+		prePrepareCopy.Sequence, prePrepareCopy.View)
 
 	sig, err := consensus.signer.Sign(consensus.chainConf.ChainConfig().Crypto.Hash, prePrepareBz)
 	if err != nil {
@@ -167,6 +220,14 @@ func (consensus *ConsensusPBFTImpl) procPrePrepare(prePrepare *pbftpb.PrePrepare
 		consensus.Id, consensus.Sequence, consensus.View, consensus.Step,
 		prePrepare.Primary, prePrepare.Sequence, prePrepare.View, prePrepare.Digest)
 
+	// Log PrePrepare details for debugging
+	if prePrepare.Block != nil {
+		consensus.logger.Infof("[%s] pre-prepare contains block (height: %d, txCount: %d)",
+			consensus.Id, prePrepare.Block.Header.BlockHeight, prePrepare.Block.Header.TxCount)
+	} else {
+		consensus.logger.Warnf("[%s] pre-prepare does not contain block", consensus.Id)
+	}
+
 	// Check if we are a backup node
 	if consensus.isPrimary() {
 		consensus.logger.Debugf("[%s] primary node ignores pre-prepare", consensus.Id)
@@ -175,27 +236,23 @@ func (consensus *ConsensusPBFTImpl) procPrePrepare(prePrepare *pbftpb.PrePrepare
 
 	// Handle future messages (for sequence ahead of current)
 	if prePrepare.Sequence > consensus.Sequence {
-		consensus.logger.Infof("[%s] receive future pre-prepare for sequence %d (current: %d)",
+		consensus.logger.Infof("[%s] receive future pre-prepare for sequence %d (current: %d), caching",
 			consensus.Id, prePrepare.Sequence, consensus.Sequence)
 
-		// If the sequence is only 1 ahead, we might be lagging behind
-		// Check if we should sync to the future sequence
-		currentHeight, err := consensus.ledgerCache.CurrentHeight()
-		if err == nil && prePrepare.Sequence == currentHeight+1 {
-			// The future sequence matches the expected next height
-			// This means we should sync our consensus state
-			consensus.logger.Infof("[%s] syncing to sequence %d from future pre-prepare",
-				consensus.Id, prePrepare.Sequence)
-			// Reset state and enter new sequence
-			consensus.enterNewSequence(prePrepare.Sequence)
-			// Process the pre-prepare message now
-			// Continue to process the message below
-		} else {
-			// Sequence is too far ahead, cannot sync
-			consensus.logger.Warnf("[%s] future pre-prepare sequence %d too far ahead (current: %d, ledger: %d), ignoring",
-				consensus.Id, prePrepare.Sequence, consensus.Sequence, currentHeight)
-			return
+		// Cache future pre-prepare messages instead of directly syncing
+		// This is more robust and avoids view mismatch issues
+		consensus.futureCacheMutex.Lock()
+		if consensus.futurePrePrepareCache == nil {
+			consensus.futurePrePrepareCache = make(map[uint64]*pbftpb.PrePrepare)
 		}
+		// Only cache if not already present (avoid overwriting with duplicates)
+		if _, exists := consensus.futurePrePrepareCache[prePrepare.Sequence]; !exists {
+			consensus.futurePrePrepareCache[prePrepare.Sequence] = prePrepare
+			consensus.logger.Debugf("[%s] cached future pre-prepare for sequence %d",
+				consensus.Id, prePrepare.Sequence)
+		}
+		consensus.futureCacheMutex.Unlock()
+		return
 	}
 
 	// Check sequence and view
@@ -332,9 +389,10 @@ func (consensus *ConsensusPBFTImpl) procPrepare(prepare *pbftpb.Prepare) {
 	}
 
 	if prepareVoteSet.HasTwoThirdsMajority() {
-		consensus.logger.Infof("[%s] received 2f+1 prepare votes, entering commit phase",
+		consensus.logger.Infof("[%s] received 2f+1 prepare votes, will enter commit phase after releasing lock",
 			consensus.Id)
-		consensus.enterCommit()
+		// Don't call enterCommit here - it will be called from handleConsensusMsg after releasing lock
+		// to avoid deadlock (enterCommit -> sendConsensusCommit -> sendConsensusMsg needs read lock)
 	} else {
 		// Check if we need to set timeout
 		if consensus.Step == pbftpb.PBFTStep_PREPARE {
@@ -602,7 +660,7 @@ func (consensus *ConsensusPBFTImpl) procNewView(newView *pbftpb.NewView) {
 // enterPrepare enters the Prepare phase
 func (consensus *ConsensusPBFTImpl) enterPrepare() {
 	if consensus.PrePrepare == nil {
-		consensus.logger.Warnf("[%s] cannot enter prepare without pre-prepare", consensus.Id)
+		consensus.logger.Errorf("[%s] cannot enter prepare without PrePrepare", consensus.Id)
 		return
 	}
 
@@ -648,13 +706,8 @@ func (consensus *ConsensusPBFTImpl) enterPrepare() {
 	consensus.sendConsensusPrepare(prepare, "")
 
 	// Check if we already have 2f+1 votes
-	prepareVoteSet := NewPrepareVoteSet(consensus.logger, consensus.View, consensus.Sequence,
-		consensus.PrePrepare.Digest, consensus.validatorSet)
-	for _, v := range consensus.PrepareVoteSet.Votes {
-		prepareVoteSet.AddVote(v)
-	}
-
-	if prepareVoteSet.HasTwoThirdsMajority() {
+	// Use hasPrepareQuorum() instead of recreating vote set (fix duplicate check)
+	if consensus.hasPrepareQuorum() {
 		consensus.logger.Infof("[%s] already have 2f+1 prepare votes, entering commit phase",
 			consensus.Id)
 		consensus.enterCommit()
@@ -671,8 +724,19 @@ func (consensus *ConsensusPBFTImpl) enterPrepare() {
 }
 
 // enterCommit enters the Commit phase
+// Note: This function assumes the write lock is NOT held when called
+// If called from handleConsensusMsg, the lock should be released before calling this function
 func (consensus *ConsensusPBFTImpl) enterCommit() {
+	consensus.Lock()
+
+	if consensus.PrePrepare == nil {
+		consensus.Unlock()
+		consensus.logger.Errorf("[%s] cannot enter commit without PrePrepare", consensus.Id)
+		return
+	}
+
 	if consensus.PrepareVoteSet == nil || !consensus.hasPrepareQuorum() {
+		consensus.Unlock()
 		consensus.logger.Warnf("[%s] cannot enter commit without prepare quorum", consensus.Id)
 		return
 	}
@@ -701,6 +765,7 @@ func (consensus *ConsensusPBFTImpl) enterCommit() {
 	}
 
 	if err := consensus.signCommit(commit); err != nil {
+		consensus.Unlock()
 		consensus.logger.Errorf("[%s] sign commit failed: %v", consensus.Id, err)
 		return
 	}
@@ -709,8 +774,16 @@ func (consensus *ConsensusPBFTImpl) enterCommit() {
 	consensus.CommitVoteSet.Votes[consensus.Id] = commit
 	consensus.CommitVoteSet.Sum++
 
-	// Broadcast Commit message
+	// Release write lock before sending messages to avoid deadlock
+	// (sendConsensusCommit -> sendConsensusMsg needs read lock)
+	consensus.Unlock()
+
+	// Broadcast Commit message (without write lock)
 	consensus.sendConsensusCommit(commit, "")
+
+	// Re-acquire lock to check commit quorum
+	consensus.Lock()
+	defer consensus.Unlock()
 
 	// Check if we already have 2f+1 votes
 	commitVoteSet := NewCommitVoteSet(consensus.logger, consensus.View, consensus.Sequence,
@@ -786,6 +859,7 @@ func (consensus *ConsensusPBFTImpl) enterNewSequence(sequence uint64) {
 
 	// Reset state for new sequence
 	consensus.Sequence = sequence
+	consensus.View = 0 // Reset view to 0 for new sequence (critical fix)
 	consensus.Step = pbftpb.PBFTStep_NEW_HEIGHT
 	consensus.PrePrepare = nil
 	consensus.PrepareVoteSet = nil
@@ -803,14 +877,20 @@ func (consensus *ConsensusPBFTImpl) enterNewSequence(sequence uint64) {
 	consensus.sendProposeState(consensus.isPrimary())
 }
 
-// replayCachedMessages replays cached future prepare and commit messages for the given sequence
+// replayCachedMessages replays cached future pre-prepare, prepare and commit messages for the given sequence
 // Note: This function should be called while holding the main consensus lock (via enterNewSequence)
 func (consensus *ConsensusPBFTImpl) replayCachedMessages(sequence uint64) {
 	// Collect cached messages first (with cache lock)
+	var prePrepare *pbftpb.PrePrepare
 	prepareMessages := make([]*pbftpb.Prepare, 0)
 	commitMessages := make([]*pbftpb.Commit, 0)
 
 	consensus.futureCacheMutex.Lock()
+	// Collect pre-prepare message
+	if cachedPrePrepare, exists := consensus.futurePrePrepareCache[sequence]; exists {
+		prePrepare = cachedPrePrepare
+		delete(consensus.futurePrePrepareCache, sequence)
+	}
 	// Collect prepare messages
 	if prepareCache, exists := consensus.futurePrepareCache[sequence]; exists && len(prepareCache) > 0 {
 		for _, prepare := range prepareCache {
@@ -827,6 +907,11 @@ func (consensus *ConsensusPBFTImpl) replayCachedMessages(sequence uint64) {
 	}
 	// Clean up old cache entries (keep only sequences within reasonable range)
 	maxCacheSequence := sequence + 10 // Keep cache for sequences up to 10 ahead
+	for seq := range consensus.futurePrePrepareCache {
+		if seq < sequence || seq > maxCacheSequence {
+			delete(consensus.futurePrePrepareCache, seq)
+		}
+	}
 	for seq := range consensus.futurePrepareCache {
 		if seq < sequence || seq > maxCacheSequence {
 			delete(consensus.futurePrepareCache, seq)
@@ -838,6 +923,13 @@ func (consensus *ConsensusPBFTImpl) replayCachedMessages(sequence uint64) {
 		}
 	}
 	consensus.futureCacheMutex.Unlock()
+
+	// Replay cached pre-prepare message first (if exists)
+	if prePrepare != nil {
+		consensus.logger.Infof("[%s] replaying cached pre-prepare for sequence %d",
+			consensus.Id, sequence)
+		consensus.procPrePrepare(prePrepare)
+	}
 
 	// Replay cached prepare messages (without cache lock, but main lock should be held by caller)
 	if len(prepareMessages) > 0 {
@@ -891,7 +983,11 @@ func (consensus *ConsensusPBFTImpl) updateChainConfig() (addedValidators []strin
 }
 
 // enterViewChange enters view change phase
+// Note: This function assumes the write lock is NOT held when called
+// If called from functions that hold the lock, the lock should be released before calling this function
 func (consensus *ConsensusPBFTImpl) enterViewChange() {
+	consensus.Lock()
+
 	consensus.logger.Infof("[%s](%d/%d/%s) enter view change",
 		consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
 
@@ -915,6 +1011,7 @@ func (consensus *ConsensusPBFTImpl) enterViewChange() {
 	}
 
 	if err := consensus.signViewChange(viewChange); err != nil {
+		consensus.Unlock()
 		consensus.logger.Errorf("[%s] sign view-change failed: %v", consensus.Id, err)
 		return
 	}
@@ -922,7 +1019,11 @@ func (consensus *ConsensusPBFTImpl) enterViewChange() {
 	// Add our own view change vote
 	consensus.ViewChangeVotes[consensus.Id] = viewChange
 
-	// Broadcast ViewChange message
+	// Release write lock before sending messages to avoid deadlock
+	// (sendConsensusViewChange -> sendConsensusMsg needs read lock)
+	consensus.Unlock()
+
+	// Broadcast ViewChange message (without write lock)
 	consensus.sendConsensusViewChange(viewChange, "")
 
 	consensus.logger.Infof("[%s](%d/%d/%s) broadcasted view-change message",
@@ -939,6 +1040,7 @@ func (consensus *ConsensusPBFTImpl) enterViewChange() {
 }
 
 // createAndBroadcastNewView creates and broadcasts a NewView message
+// NOTE: This function must be called while holding the consensus write lock
 func (consensus *ConsensusPBFTImpl) createAndBroadcastNewView() {
 	if len(consensus.ViewChangeVotes) < int(consensus.validatorSet.Size()*2/3+1) {
 		consensus.logger.Warnf("[%s] insufficient view-change votes for new-view: %d",
@@ -983,6 +1085,7 @@ func (consensus *ConsensusPBFTImpl) createAndBroadcastNewView() {
 }
 
 // enterNewView enters a new view after receiving NewView message
+// NOTE: This function must be called while holding the consensus write lock
 func (consensus *ConsensusPBFTImpl) enterNewView(newView *pbftpb.NewView) {
 	consensus.logger.Infof("[%s](%d/%d/%s) enter new view",
 		consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
@@ -1007,6 +1110,10 @@ func (consensus *ConsensusPBFTImpl) hasPrepareQuorum() bool {
 	if consensus.PrepareVoteSet == nil {
 		return false
 	}
+	if consensus.PrePrepare == nil {
+		consensus.logger.Warnf("[%s] hasPrepareQuorum: PrePrepare is nil", consensus.Id)
+		return false
+	}
 	prepareVoteSet := NewPrepareVoteSet(consensus.logger, consensus.View, consensus.Sequence,
 		consensus.PrePrepare.Digest, consensus.validatorSet)
 	for _, v := range consensus.PrepareVoteSet.Votes {
@@ -1018,6 +1125,10 @@ func (consensus *ConsensusPBFTImpl) hasPrepareQuorum() bool {
 // hasCommitQuorum checks if we have 2f+1 commit votes
 func (consensus *ConsensusPBFTImpl) hasCommitQuorum() bool {
 	if consensus.CommitVoteSet == nil {
+		return false
+	}
+	if consensus.PrePrepare == nil {
+		consensus.logger.Warnf("[%s] hasCommitQuorum: PrePrepare is nil", consensus.Id)
 		return false
 	}
 	commitVoteSet := NewCommitVoteSet(consensus.logger, consensus.View, consensus.Sequence,
@@ -1034,15 +1145,25 @@ func (consensus *ConsensusPBFTImpl) verifyPrePrepare(prePrepare *pbftpb.PrePrepa
 		return fmt.Errorf("pre-prepare without endorsement")
 	}
 
-	prePrepareCopy := &pbftpb.PrePrepare{
-		Primary:  prePrepare.Primary,
-		View:     prePrepare.View,
-		Sequence: prePrepare.Sequence,
-		Digest:   prePrepare.Digest,
-		Block:    prePrepare.Block,
-		TxsRwSet: prePrepare.TxsRwSet,
-	}
+	// Create a copy without endorsement for verification
+	// Use CopyPrePrepareForSigning to ensure consistent serialization (same as signing)
+	// instead of proto.Clone which may introduce serialization inconsistencies
+	prePrepareCopy := CopyPrePrepareForSigning(prePrepare)
+
+	// Log before serialization to measure time
+	startTime := time.Now()
 	message := mustMarshal(prePrepareCopy)
+	serializeDuration := time.Since(startTime)
+
+	// Log serialization details for debugging
+	blockTxCount := 0
+	if prePrepareCopy.Block != nil && prePrepareCopy.Block.Header != nil {
+		blockTxCount = int(prePrepareCopy.Block.Header.TxCount)
+	}
+	consensus.logger.Infof("[%s] verifyPrePrepare: serialized size=%d bytes (%.2f MB), serialize time=%v, txCount=%d, hasBlock=%v, hasTxsRwSet=%v, primary=%s, sequence=%d, view=%d",
+		consensus.Id, len(message), float64(len(message))/1024/1024, serializeDuration,
+		blockTxCount, prePrepareCopy.Block != nil, prePrepareCopy.TxsRwSet != nil, prePrepare.Primary,
+		prePrepareCopy.Sequence, prePrepareCopy.View)
 
 	principal, err := consensus.ac.CreatePrincipal(
 		protocol.ResourceNameConsensusNode,
@@ -1446,6 +1567,8 @@ type ConsensusPBFTImpl struct {
 
 	state int32
 
+	// Cache for future pre-prepare messages (sequence -> pre-prepare)
+	futurePrePrepareCache map[uint64]*pbftpb.PrePrepare
 	// Cache for future prepare messages (sequence -> map[nodeId] -> prepare)
 	futurePrepareCache map[uint64]map[string]*pbftpb.Prepare
 	// Cache for future commit messages (sequence -> map[nodeId] -> commit)
@@ -1493,10 +1616,14 @@ func New(config *consensusUtils.ConsensusImplConfig) (*ConsensusPBFTImpl, error)
 	if err != nil {
 		return nil, err
 	}
+	consensus.logger.Infof("[%s] New ConsensusPBFTImpl: got %d validators from config: %v",
+		config.NodeId, len(validators), validators)
 	consensus.validatorSet = newValidatorSet(consensus.logger, validators)
+	consensus.logger.Debugf("[%s] New ConsensusPBFTImpl: validatorSet initialized", config.NodeId)
 	consensus.ConsensusState = NewConsensusState(consensus.logger, consensus.Id)
 	consensus.consensusStateCache = newConsensusStateCache(defaultConsensusStateCacheSize)
 	consensus.timeScheduler = newTimeScheduler(consensus.logger, config.NodeId)
+	consensus.futurePrePrepareCache = make(map[uint64]*pbftpb.PrePrepare)
 	consensus.futurePrepareCache = make(map[uint64]map[string]*pbftpb.Prepare)
 	consensus.futureCommitCache = make(map[uint64]map[string]*pbftpb.Commit)
 
@@ -1532,9 +1659,12 @@ func (consensus *ConsensusPBFTImpl) Start() error {
 			return
 		}
 		// 注册到消息总线以订阅主题
+		consensus.logger.Infof("[%s] registering to message bus topics: %v", consensus.Id, msgBusTopics)
 		for _, topic := range msgBusTopics {
 			consensus.msgbus.Register(topic, consensus)
+			consensus.logger.Debugf("[%s] registered to message bus topic: %v", consensus.Id, topic)
 		}
+		consensus.logger.Infof("[%s] message bus registration completed", consensus.Id)
 		_ = chainconf.RegisterVerifier(consensus.chainID, consensuspb.ConsensusType_PBFT, consensus)
 
 		consensus.logger.Infof("start ConsensusPBFTImpl[%s]", consensus.Id)
@@ -1598,14 +1728,35 @@ func (consensus *ConsensusPBFTImpl) OnMessage(message *msgbus.Message) {
 		}
 	//核心引擎提交区块到账本
 	case msgbus.RecvConsensusMsg:
+		consensus.logger.Debugf("[%s] OnMessage: received RecvConsensusMsg topic", consensus.Id)
 		if msg, ok := message.Payload.(*netpb.NetMsg); ok {
+			consensus.logger.Infof("[%s] received consensus message (type: %v, size: %d, to: '%s')",
+				consensus.Id, msg.Type, len(msg.Payload), msg.To)
+			if len(msg.Payload) == 0 {
+				consensus.logger.Warnf("[%s] received consensus message with empty payload", consensus.Id)
+				return
+			}
+			consensus.logger.Debugf("[%s] attempting to parse consensus message, payload size: %d bytes (%.2f MB)",
+				consensus.Id, len(msg.Payload), float64(len(msg.Payload))/1024/1024)
+			startTime := time.Now()
 			if consensusMsg := consensus.createConsensusMsgFromPBFTMsgBz(msg.Payload); consensusMsg != nil {
-				consensus.externalMsgC <- consensusMsg
+				parseDuration := time.Since(startTime)
+				consensus.logger.Infof("[%s] successfully parsed consensus message (type: %v, size: %d bytes, parse time: %v), sending to externalMsgC",
+					consensus.Id, consensusMsg.Type, len(msg.Payload), parseDuration)
+				consensus.logger.Infof("[%s] successfully parsed consensus message (type: %v), sending to externalMsgC",
+					consensus.Id, consensusMsg.Type)
+				select {
+				case consensus.externalMsgC <- consensusMsg:
+					consensus.logger.Debugf("[%s] consensus message sent to externalMsgC channel", consensus.Id)
+				default:
+					consensus.logger.Warnf("[%s] externalMsgC channel is full, dropping consensus message", consensus.Id)
+				}
 			} else {
-				consensus.logger.Warnf("assert Consensus Msg failed")
+				consensus.logger.Warnf("[%s] failed to parse consensus message (payload size: %d)",
+					consensus.Id, len(msg.Payload))
 			}
 		} else {
-			consensus.logger.Warnf("assert NetMsg failed, get type:{%s}", reflect.TypeOf(message.Payload))
+			consensus.logger.Warnf("[%s] assert NetMsg failed, get type:{%s}", consensus.Id, reflect.TypeOf(message.Payload))
 		}
 	//核心引擎告知PBFT已提交区块的高度等信息，PBFT进入下一个高度
 	case msgbus.BlockInfo:
@@ -1645,14 +1796,22 @@ func (consensus *ConsensusPBFTImpl) Verify(consensusType consensuspb.ConsensusTy
 // createConsensusMsgFromPBFTMsgBz creates ConsensusMsg from PBFT message bytes
 func (consensus *ConsensusPBFTImpl) createConsensusMsgFromPBFTMsgBz(msgBz []byte) *ConsensusMsg {
 	if msgBz == nil || len(msgBz) == 0 {
+		consensus.logger.Debugf("[%s] createConsensusMsgFromPBFTMsgBz: empty message bytes", consensus.Id)
 		return nil
 	}
 
+	consensus.logger.Debugf("[%s] createConsensusMsgFromPBFTMsgBz: unmarshaling PBFTMsg, size: %d",
+		consensus.Id, len(msgBz))
 	pbftMsg := &pbftpb.PBFTMsg{}
+	startTime := time.Now()
 	if err := proto.Unmarshal(msgBz, pbftMsg); err != nil {
-		consensus.logger.Warnf("unmarshal PBFTMsg failed: %v", err)
+		consensus.logger.Warnf("[%s] unmarshal PBFTMsg failed: %v (payload size: %d bytes)", consensus.Id, err, len(msgBz))
 		return nil
 	}
+	unmarshalDuration := time.Since(startTime)
+
+	consensus.logger.Debugf("[%s] createConsensusMsgFromPBFTMsgBz: PBFTMsg type: %v, inner msg size: %d bytes, unmarshal time: %v",
+		consensus.Id, pbftMsg.Type, len(pbftMsg.Msg), unmarshalDuration)
 
 	consensusMsg := &ConsensusMsg{
 		Type: pbftMsg.Type,
@@ -1660,11 +1819,20 @@ func (consensus *ConsensusPBFTImpl) createConsensusMsgFromPBFTMsgBz(msgBz []byte
 
 	switch pbftMsg.Type {
 	case pbftpb.PBFTMsgType_MSG_PREPREPARE:
+		consensus.logger.Debugf("[%s] createConsensusMsgFromPBFTMsgBz: parsing PrePrepare message", consensus.Id)
 		prePrepare := &pbftpb.PrePrepare{}
+		startTime := time.Now()
 		if err := proto.Unmarshal(pbftMsg.Msg, prePrepare); err != nil {
-			consensus.logger.Warnf("unmarshal PrePrepare failed: %v", err)
+			consensus.logger.Warnf("[%s] unmarshal PrePrepare failed: %v (inner msg size: %d bytes)", consensus.Id, err, len(pbftMsg.Msg))
 			return nil
 		}
+		unmarshalDuration := time.Since(startTime)
+		txCount := 0
+		if prePrepare.Block != nil && prePrepare.Block.Header != nil {
+			txCount = int(prePrepare.Block.Header.TxCount)
+		}
+		consensus.logger.Infof("[%s] createConsensusMsgFromPBFTMsgBz: PrePrepare parsed successfully (sequence: %d, view: %d, txCount: %d, inner msg size: %d bytes, unmarshal time: %v)",
+			consensus.Id, prePrepare.Sequence, prePrepare.View, txCount, len(pbftMsg.Msg), unmarshalDuration)
 		consensusMsg.Msg = prePrepare
 	case pbftpb.PBFTMsgType_MSG_PREPARE:
 		prepare := &pbftpb.Prepare{}
@@ -1834,25 +2002,100 @@ func (consensus *ConsensusPBFTImpl) replayWal() error {
 		mustUnmarshal(lastEntry.Data, prePrepare)
 		err := consensus.enterPrepareFromReplayWal(prePrepare)
 		if err != nil {
-			return err
+			// 如果enterPrepareFromReplayWal失败，重置为NEW_HEIGHT状态，允许重新提议
+			consensus.logger.Warnf("[%s] enterPrepareFromReplayWal failed: %v, reset to NEW_HEIGHT to allow re-proposal",
+				consensus.Id, err)
+			consensus.Step = pbftpb.PBFTStep_NEW_HEIGHT
+			consensus.PrePrepare = nil
+			consensus.PrepareVoteSet = nil
+			consensus.CommitVoteSet = nil
+			// 发送通知，允许core engine重新提议区块
+			consensus.sendProposeState(consensus.isPrimary())
+			return nil // 不返回错误，允许继续运行
 		}
 	case pbftpb.WalEntryType_PREPARE_ENTRY:
 		// Replay prepare votes
 		prepareVoteSet := new(pbftpb.PrepareVoteSet)
 		mustUnmarshal(lastEntry.Data, prepareVoteSet)
 		consensus.PrepareVoteSet = prepareVoteSet
-		consensus.Step = pbftpb.PBFTStep_PREPARE
-		consensus.logger.Infof("[%s] replayed prepare vote set", consensus.Id)
+
+		// 关键修复：如果没有PrePrepare，说明PrePrepare丢失了，需要重新提议区块
+		// 这种情况下不应该进入PREPARE状态，而应该保持在NEW_HEIGHT状态，允许core engine重新提议
+		if consensus.PrePrepare == nil {
+			consensus.logger.Warnf("[%s] replayed PREPARE_ENTRY but no PrePrepare found, reset to NEW_HEIGHT to allow re-proposal",
+				consensus.Id)
+			consensus.Step = pbftpb.PBFTStep_NEW_HEIGHT
+			consensus.PrepareVoteSet = nil // 清除无效的投票，因为对应的PrePrepare已丢失
+			// 发送通知，允许core engine重新提议区块
+			consensus.sendProposeState(consensus.isPrimary())
+		} else {
+			// 有PrePrepare，正常进入PREPARE状态
+			consensus.Step = pbftpb.PBFTStep_PREPARE
+			consensus.logger.Infof("[%s] replayed prepare vote set", consensus.Id)
+
+			// If we are primary and have PrePrepare, try to re-broadcast it
+			// This helps other nodes that might have missed the PrePrepare message
+			if consensus.isPrimary() && consensus.PrePrepare != nil {
+				consensus.logger.Infof("[%s] re-broadcasting PrePrepare after WAL replay", consensus.Id)
+				consensus.sendConsensusPrePrepare(consensus.PrePrepare, "")
+			}
+
+			// Check if we already have enough votes to enter commit
+			if consensus.PrepareVoteSet != nil && len(consensus.PrepareVoteSet.Votes) > 0 {
+				prepareVoteSet := NewPrepareVoteSet(consensus.logger, consensus.View, consensus.Sequence,
+					consensus.PrepareVoteSet.Digest, consensus.validatorSet)
+				for _, v := range consensus.PrepareVoteSet.Votes {
+					prepareVoteSet.AddVote(v)
+				}
+				if prepareVoteSet.HasTwoThirdsMajority() {
+					consensus.logger.Infof("[%s] already have 2f+1 prepare votes from WAL, entering commit phase",
+						consensus.Id)
+					consensus.enterCommit()
+				}
+			}
+		}
 	case pbftpb.WalEntryType_COMMIT_ENTRY:
 		// Replay commit votes
 		commitVoteSet := new(pbftpb.CommitVoteSet)
 		mustUnmarshal(lastEntry.Data, commitVoteSet)
 		consensus.CommitVoteSet = commitVoteSet
-		consensus.Step = pbftpb.PBFTStep_COMMIT
-		consensus.logger.Infof("[%s] replayed commit vote set", consensus.Id)
+
+		// 检查PrePrepare是否存在
+		if consensus.PrePrepare == nil {
+			consensus.logger.Warnf("[%s] replayed COMMIT_ENTRY but no PrePrepare found, reset to NEW_HEIGHT",
+				consensus.Id)
+			consensus.Step = pbftpb.PBFTStep_NEW_HEIGHT
+			consensus.CommitVoteSet = nil // 清除无效的投票，因为对应的PrePrepare已丢失
+			// 发送通知，允许core engine重新提议区块
+			consensus.sendProposeState(consensus.isPrimary())
+		} else {
+			consensus.Step = pbftpb.PBFTStep_COMMIT
+			consensus.logger.Infof("[%s] replayed commit vote set", consensus.Id)
+
+			// 检查是否已有足够的commit投票
+			if consensus.CommitVoteSet != nil && len(consensus.CommitVoteSet.Votes) > 0 {
+				commitVoteSet := NewCommitVoteSet(consensus.logger, consensus.View, consensus.Sequence,
+					consensus.PrePrepare.Digest, consensus.validatorSet)
+				for _, v := range consensus.CommitVoteSet.Votes {
+					commitVoteSet.AddVote(v)
+				}
+				if commitVoteSet.HasTwoThirdsMajority() {
+					consensus.logger.Infof("[%s] already have 2f+1 commit votes from WAL, committing block",
+						consensus.Id)
+					consensus.enterCommitted()
+				}
+			}
+		}
 	default:
-		consensus.logger.Warnf("[%s] wal replay found unrecognized type[%v], this should not happen",
+		consensus.logger.Warnf("[%s] wal replay found unrecognized type[%v], this should not happen, reset to NEW_HEIGHT",
 			consensus.Id, lastEntry.Type)
+		// 未知类型，重置为NEW_HEIGHT状态，允许重新提议
+		consensus.Step = pbftpb.PBFTStep_NEW_HEIGHT
+		consensus.PrePrepare = nil
+		consensus.PrepareVoteSet = nil
+		consensus.CommitVoteSet = nil
+		// 发送通知，允许core engine重新提议区块
+		consensus.sendProposeState(consensus.isPrimary())
 	}
 	return nil
 }
@@ -1870,6 +2113,12 @@ func (consensus *ConsensusPBFTImpl) enterPrepareFromReplayWal(prePrepare *pbftpb
 	consensus.PrePrepare = prePrepare
 	consensus.Step = pbftpb.PBFTStep_PRE_PREPARE
 
+	// If we are primary, re-broadcast PrePrepare to ensure other nodes receive it
+	if consensus.isPrimary() {
+		consensus.logger.Infof("[%s] re-broadcasting PrePrepare after WAL replay", consensus.Id)
+		consensus.sendConsensusPrePrepare(prePrepare, "")
+	}
+
 	// Enter prepare phase
 	consensus.enterPrepare()
 
@@ -1881,7 +2130,6 @@ func (consensus *ConsensusPBFTImpl) enterPrepareFromReplayWal(prePrepare *pbftpb
 // This is called when the primary node receives a proposed block from core engine
 func (consensus *ConsensusPBFTImpl) handleProposedBlock(proposedProposal *proposedProposal) {
 	consensus.Lock()
-	defer consensus.Unlock()
 
 	block := proposedProposal.proposedBlock.Block
 	consensus.logger.Infof("[%s](%d/%d/%s) receive block from core engine (%d/%x), isPrimary: %v",
@@ -1892,18 +2140,21 @@ func (consensus *ConsensusPBFTImpl) handleProposedBlock(proposedProposal *propos
 	if block.Header.BlockHeight != consensus.Sequence {
 		consensus.logger.Warnf("[%s](%d/%d/%s) receive block from invalid sequence: %d",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step, block.Header.BlockHeight)
+		consensus.Unlock()
 		return
 	}
 
 	if !consensus.isPrimary() {
 		consensus.logger.Warnf("[%s](%d/%d/%s) receive proposal but is not primary",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
+		consensus.Unlock()
 		return
 	}
 
 	if consensus.Step != pbftpb.PBFTStep_NEW_HEIGHT && consensus.Step != pbftpb.PBFTStep_PRE_PREPARE {
 		consensus.logger.Warnf("[%s](%d/%d/%s) receive proposal at wrong step",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
+		consensus.Unlock()
 		return
 	}
 
@@ -1911,6 +2162,7 @@ func (consensus *ConsensusPBFTImpl) handleProposedBlock(proposedProposal *propos
 	hash, sig, err := utils.SignBlock(consensus.chainConf.ChainConfig().Crypto.Hash, consensus.signer, block)
 	if err != nil {
 		consensus.logger.Errorf("[%s] sign block failed, %s", consensus.Id, err)
+		consensus.Unlock()
 		return
 	}
 	block.Header.BlockHash = hash[:]
@@ -1932,6 +2184,7 @@ func (consensus *ConsensusPBFTImpl) handleProposedBlock(proposedProposal *propos
 	// Sign PrePrepare message
 	if err := consensus.signPrePrepare(prePrepare); err != nil {
 		consensus.logger.Errorf("[%s] sign pre-prepare failed: %v", consensus.Id, err)
+		consensus.Unlock()
 		return
 	}
 
@@ -1956,7 +2209,13 @@ func (consensus *ConsensusPBFTImpl) handleProposedBlock(proposedProposal *propos
 		Step:     pbftpb.PBFTStep_PRE_PREPARE,
 	})
 
-	// Broadcast PrePrepare message
+	// Release write lock before sending messages to avoid deadlock
+	// (sendConsensusPrePrepare -> sendConsensusMsg needs read lock)
+	// We need to unlock manually here because sendConsensusMsg requires RLock(),
+	// and RWMutex doesn't allow upgrading from write lock to read lock
+	consensus.Unlock()
+
+	// Broadcast PrePrepare message (without write lock)
 	consensus.sendConsensusPrePrepare(prePrepare, "")
 
 	// Tell core engine that we are no longer proposing
@@ -1970,7 +2229,6 @@ func (consensus *ConsensusPBFTImpl) handleProposedBlock(proposedProposal *propos
 // This is called when a backup node verifies the block successfully
 func (consensus *ConsensusPBFTImpl) handleVerifyResult(verifyResult *consensuspb.VerifyResult) {
 	consensus.Lock()
-	defer consensus.Unlock()
 
 	height := verifyResult.VerifiedBlock.Header.BlockHeight
 	hash := verifyResult.VerifiedBlock.Header.BlockHash
@@ -1981,12 +2239,14 @@ func (consensus *ConsensusPBFTImpl) handleVerifyResult(verifyResult *consensuspb
 	if consensus.Sequence != height {
 		consensus.logger.Warnf("[%s](%d/%d/%s) receive verify result for wrong sequence: %d",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step, height)
+		consensus.Unlock()
 		return
 	}
 
 	if consensus.PrePrepare == nil {
 		consensus.logger.Warnf("[%s](%d/%d/%s) receive verify result but PrePrepare is nil",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
+		consensus.Unlock()
 		return
 	}
 
@@ -1994,6 +2254,7 @@ func (consensus *ConsensusPBFTImpl) handleVerifyResult(verifyResult *consensuspb
 		consensus.logger.Warnf("[%s](%d/%d/%s) verify result hash mismatch: expected %x, got %x",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step,
 			consensus.PrePrepare.Digest, hash)
+		consensus.Unlock()
 		return
 	}
 
@@ -2001,6 +2262,9 @@ func (consensus *ConsensusPBFTImpl) handleVerifyResult(verifyResult *consensuspb
 		consensus.logger.Warnf("[%s](%d/%d/%s) block verification failed",
 			consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
 		consensus.PrePrepare = nil
+		// Release write lock before calling enterViewChange to avoid deadlock
+		// (enterViewChange -> sendConsensusViewChange -> sendConsensusMsg needs read lock)
+		consensus.Unlock()
 		// Trigger view change on verification failure
 		consensus.enterViewChange()
 		return
@@ -2013,7 +2277,11 @@ func (consensus *ConsensusPBFTImpl) handleVerifyResult(verifyResult *consensuspb
 	// Update digest to match verified block
 	consensus.PrePrepare.Digest = verifyResult.VerifiedBlock.Header.BlockHash
 
-	// Enter Prepare phase
+	// Release write lock before calling enterPrepare to avoid deadlock
+	// (enterPrepare -> sendConsensusPrepare -> sendConsensusMsg needs read lock)
+	consensus.Unlock()
+
+	// Enter Prepare phase (without write lock)
 	consensus.enterPrepare()
 }
 
@@ -2024,6 +2292,17 @@ func (consensus *ConsensusPBFTImpl) handleBlockHeight(height uint64) {
 
 	consensus.logger.Infof("[%s](%d/%d/%s) receive block height %d",
 		consensus.Id, consensus.Sequence, consensus.View, consensus.Step, height)
+
+	// Check if we need to update sequence due to block commit
+	// If consensus sequence is behind the committed height, we need to catch up
+	if consensus.Sequence < height {
+		// Consensus is behind, enter new sequence
+		consensus.logger.Infof("[%s](%d/%d/%s) consensus behind committed height %d, entering new sequence",
+			consensus.Id, consensus.Sequence, consensus.View, consensus.Step, height)
+		consensus.Unlock()
+		consensus.enterNewSequence(height + 1)
+		return
+	}
 
 	// Check if we need to reset state due to block commit
 	// If we are stuck in PREPARE or COMMIT phase and receive a block height that means
@@ -2058,26 +2337,43 @@ func (consensus *ConsensusPBFTImpl) handleBlockHeight(height uint64) {
 // handleConsensusMsg handles consensus messages
 func (consensus *ConsensusPBFTImpl) handleConsensusMsg(msg *ConsensusMsg) {
 	consensus.Lock()
-	defer consensus.Unlock()
 
 	switch msg.Type {
 	case pbftpb.PBFTMsgType_MSG_PREPREPARE:
 		consensus.procPrePrepare(msg.Msg.(*pbftpb.PrePrepare))
+		consensus.Unlock()
 	case pbftpb.PBFTMsgType_MSG_PREPARE:
-		consensus.procPrepare(msg.Msg.(*pbftpb.Prepare))
+		// procPrepare may need to call enterCommit, which needs to send messages (requires read lock)
+		// So we need to check if we should enter commit, then release lock before calling enterCommit
+		prepare := msg.Msg.(*pbftpb.Prepare)
+		consensus.procPrepare(prepare)
+
+		// Check if we should enter commit phase (after procPrepare has updated state)
+		shouldEnterCommit := false
+		if consensus.PrepareVoteSet != nil && consensus.hasPrepareQuorum() {
+			shouldEnterCommit = true
+		}
+		consensus.Unlock()
+
+		// Call enterCommit without lock (it will acquire its own lock if needed)
+		if shouldEnterCommit {
+			consensus.enterCommit()
+		}
 	case pbftpb.PBFTMsgType_MSG_COMMIT:
 		consensus.procCommit(msg.Msg.(*pbftpb.Commit))
+		consensus.Unlock()
 	case pbftpb.PBFTMsgType_MSG_VIEWCHANGE:
 		consensus.procViewChange(msg.Msg.(*pbftpb.ViewChange))
+		consensus.Unlock()
 	case pbftpb.PBFTMsgType_MSG_NEWVIEW:
 		consensus.procNewView(msg.Msg.(*pbftpb.NewView))
+		consensus.Unlock()
 	}
 }
 
 // handleTimeout handles timeout events
 func (consensus *ConsensusPBFTImpl) handleTimeout(ti pbftpb.TimeoutInfo) {
 	consensus.Lock()
-	defer consensus.Unlock()
 
 	consensus.logger.Infof("[%s](%d/%d/%s) handleTimeout ti: %v",
 		consensus.Id, consensus.Sequence, consensus.View, consensus.Step, ti)
@@ -2085,6 +2381,7 @@ func (consensus *ConsensusPBFTImpl) handleTimeout(ti pbftpb.TimeoutInfo) {
 	// Check if timeout is for current sequence
 	if ti.Height != consensus.Sequence {
 		consensus.logger.Debugf("[%s] ignore outdated timeout: %v", consensus.Id, ti)
+		consensus.Unlock()
 		return
 	}
 
@@ -2104,10 +2401,17 @@ func (consensus *ConsensusPBFTImpl) handleTimeout(ti pbftpb.TimeoutInfo) {
 			consensus.CommitVoteSet = nil
 			consensus.sendProposeState(consensus.isPrimary())
 			consensus.logger.Infof("[%s] reset to NEW_HEIGHT state after timeout", consensus.Id)
+			consensus.Unlock()
 			return
 		}
-		// Otherwise, trigger view change
+		// Unified timeout handling: both primary and backup should trigger view change
+		// This ensures consistency across all nodes
+		consensus.logger.Warnf("[%s](%d/%d/%s) timeout in PREPARE phase, triggering view change",
+			consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
+		// Release write lock before calling enterViewChange to avoid deadlock
+		consensus.Unlock()
 		consensus.enterViewChange()
+		return
 	case pbftpb.PBFTStep_COMMIT:
 		// Timeout in Commit phase, similar check
 		currentHeight, err := consensus.ledgerCache.CurrentHeight()
@@ -2120,12 +2424,21 @@ func (consensus *ConsensusPBFTImpl) handleTimeout(ti pbftpb.TimeoutInfo) {
 			consensus.CommitVoteSet = nil
 			consensus.sendProposeState(consensus.isPrimary())
 			consensus.logger.Infof("[%s] reset to NEW_HEIGHT state after timeout", consensus.Id)
+			consensus.Unlock()
 			return
 		}
-		// Otherwise, trigger view change
+		// Unified timeout handling: trigger view change
+		consensus.logger.Warnf("[%s](%d/%d/%s) timeout in COMMIT phase, triggering view change",
+			consensus.Id, consensus.Sequence, consensus.View, consensus.Step)
+		// Release write lock before calling enterViewChange to avoid deadlock
+		consensus.Unlock()
 		consensus.enterViewChange()
+		return
 	case pbftpb.PBFTStep_VIEW_CHANGE:
 		// View change timeout, try next view
+		// Release write lock before calling enterViewChange to avoid deadlock
+		consensus.Unlock()
 		consensus.enterViewChange()
+		return
 	}
 }

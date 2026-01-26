@@ -106,14 +106,29 @@ func (valSet *validatorSet) hasValidator(validator string) bool {
 // In PBFT, primary is determined by: primary = validators[(view + blocknumber) % len(validators)]
 func (valSet *validatorSet) GetPrimary(view uint64, blockNumber uint64) (validator string, err error) {
 	if valSet.isNilOrEmpty() {
+		valSet.logger.Warnf("GetPrimary: validatorSet is nil or empty")
 		return "", ErrInvalidIndex
 	}
 
 	valSet.Lock()
 	defer valSet.Unlock()
 
+	if len(valSet.Validators) == 0 {
+		valSet.logger.Warnf("GetPrimary: validators list is empty")
+		return "", ErrInvalidIndex
+	}
+
 	index := int((view + blockNumber) % uint64(len(valSet.Validators)))
-	return valSet.Validators[index], nil
+	if index < 0 || index >= len(valSet.Validators) {
+		valSet.logger.Errorf("GetPrimary: invalid index %d for validators list of size %d (view=%d, blockNumber=%d)", 
+			index, len(valSet.Validators), view, blockNumber)
+		return "", ErrInvalidIndex
+	}
+	
+	primary := valSet.Validators[index]
+	valSet.logger.Infof("GetPrimary: view=%d, blockNumber=%d, index=%d, primary=%s, validators=%v", 
+		view, blockNumber, index, primary, valSet.Validators)
+	return primary, nil
 }
 
 // updateValidators updates the collection based on the input and returns arrays of additions and deletions

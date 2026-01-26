@@ -1,0 +1,48 @@
+chain_client:
+  # 链ID
+  chain_id: "chain1"
+  # 组织ID
+  org_id: "wx-org.chainmaker.org"
+  # 客户端用户私钥路径（使用绝对路径）
+  user_key_file_path: "/root/chainmaker-go-master/tools/cmc/testdata/crypto-config/wx-org.chainmaker.org/user/client1/client1.tls.key"
+  # 客户端用户证书路径（使用绝对路径）
+  user_crt_file_path: "/root/chainmaker-go-master/tools/cmc/testdata/crypto-config/wx-org.chainmaker.org/user/client1/client1.tls.crt"
+  # 客户端用户交易签名私钥路径（使用绝对路径）
+  user_sign_key_file_path: "/root/chainmaker-go-master/tools/cmc/testdata/crypto-config/wx-org.chainmaker.org/user/client1/client1.sign.key"
+  # 客户端用户交易签名证书路径（使用绝对路径）
+  user_sign_crt_file_path: "/root/chainmaker-go-master/tools/cmc/testdata/crypto-config/wx-org.chainmaker.org/user/client1/client1.sign.crt"
+  # 节点是否仅支持异步返回的方式
+  node_only_async: false
+  # 同步交易结果模式下，轮询获取交易结果时的最大轮询次数
+  retry_limit: 20
+  # 同步交易结果模式下，每次轮询交易结果时的等待时间，单位：ms
+  retry_interval: 500
+  # txid配置项：默认支持TimestampKey，如果开启enableNormalKey则使用NormalKey
+  enable_normal_key: false
+  # 优化连接检查周期，单位：s
+  optimize_detection: -1
+  disable_subscribe_optimize: false
+
+  nodes:
+    - # 节点地址，格式为：IP:端口:连接数
+      node_addr: "127.0.0.1:12301"
+      # 节点连接数
+      conn_cnt: 10
+      # RPC连接是否启用双向TLS认证
+      enable_tls: true
+      # 信任证书池路径（使用绝对路径）
+      trust_root_paths:
+        - "/root/chainmaker-go-master/tools/cmc/testdata/crypto-config/wx-org.chainmaker.org/ca"
+      # TLS hostname
+      tls_host_name: "chainmaker.org"
+      chain_tls_host_name: ""
+  rpc_client:
+    max_receive_message_size: 100
+    max_send_message_size: 100
+    send_tx_timeout: 300
+    get_tx_timeout: 300
+  pkcs11:
+    enabled: false
+  archive_center_query_first: true
+  kms:
+    enabled: false
